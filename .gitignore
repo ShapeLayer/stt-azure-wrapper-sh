@@ -1,0 +1,9 @@
+.DS_Store
+
+# Environment variables containing sensitive information
+.env
+
+# Audio files (optional - uncomment if you don't want to commit audio files)
+# *.wav
+# *.mp3
+# *.ogg

@@ -1,0 +1,385 @@
+#!/bin/bash
+
+# --- Load Environment Variables ---
+# Check if .env file exists and load it
+if [ -f ".env" ]; then
+    echo "Loading configuration from .env file..."
+    export $(grep -v '^#' .env | xargs)
+else
+    echo "Warning: .env file not found. Using environment variables or defaults."
+fi
+
+# --- Configuration ---
+# Use environment variables with fallbacks to previous defaults
+SPEECH_KEY="${SPEECH_KEY:-}"
+SPEECH_REGION="${SPEECH_REGION:-}"
+LANGUAGE="${LANGUAGE:-en-US}"
+SEGMENT_TIME=""  # Will be set by parameter or env or default
+OUTPUT_FILE=""   # Will be set by parameter if provided
+SILENT_MODE=false  # Silent mode flag
+VERBOSE_MODE=false  # Verbose mode flag
+
+# Handle audio file from command line argument or environment variable
+AUDIO_FILE=""
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -S|--split)
+            SEGMENT_TIME="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -s|--silent)
+            SILENT_MODE=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE_MODE=true
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [options] <audio_file_path>"
+            echo ""
+            echo "Azure Speech-to-Text transcription tool with audio segmentation support."
+            echo ""
+            echo "Options:"
+            echo "  -S, --split <seconds>    Segment duration in seconds (default: 30)"
+            echo "  -o, --output       Save transcription to file (written gradually)"
+            echo "  -s, --silent             Silent mode (only show progress percentage)"
+            echo "  -v, --verbose            Verbose mode (show detailed segment information)"
+            echo "  -h, --help               Show this help message and exit"
+            echo ""
+            echo "Examples:"
+            echo "  $0 -S 300 -o result.txt audio.m4a"
+            echo "  $0 -s -o result.txt audio.wav"
+            echo "  $0 -v -o result.txt audio.mp3"
+            echo ""
+            echo "Environment:"
+            echo "  SPEECH_KEY      Azure Speech Service subscription key"
+            echo "  SPEECH_REGION   Azure Speech Service region (e.g., eastus)"
+            echo "  LANGUAGE        Recognition language (default: en-US)"
+            echo "  SEGMENT_TIME    Default segment duration"
+            echo ""
+            echo "  Set these in .env file or as environment variables."
+            exit 0
+            ;;
+        *)
+            if [ -z "$AUDIO_FILE" ]; then
+                AUDIO_FILE="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Set audio file default if not provided
+if [ -z "$AUDIO_FILE" ]; then
+    AUDIO_FILE="${AUDIO_FILE:-}"
+fi
+
+# Set SEGMENT_TIME: parameter > env > default (30)
+if [ -z "$SEGMENT_TIME" ]; then
+    SEGMENT_TIME="${SEGMENT_TIME:-30}"
+fi
+
+# Show usage if no audio file provided
+if [ -z "$AUDIO_FILE" ]; then
+    echo "Error: No audio file specified."
+    echo ""
+    echo "Usage: $0 [options] <audio_file_path>"
+    echo "Options:"
+    echo "  -S, --split <seconds>    Segment duration in seconds (default: 30)"
+    echo "  -o, --output <file>      Save transcription to file (written gradually)"
+    echo "  -s, --silent             Silent mode (only show progress percentage)"
+    echo "  -v, --verbose            Verbose mode (show detailed segment information)"
+    echo "  -h, --help               Show help message"
+    echo ""
+    echo "Example: $0 -S 300 -o result.txt ./my_audio.wav"
+    echo "         $0 -s -o result.txt ./my_audio.wav"
+    echo "         $0 -v -o result.txt ./my_audio.wav"
+    echo ""
+    echo "Or set AUDIO_FILE in .env file"
+    exit 1
+fi
+
+# Check if curl is installed
+if ! command -v curl &> /dev/null; then
+    echo "Error: 'curl' is not installed. Please install it to use this script."
+    echo "  On Debian/Ubuntu: sudo apt-get install curl"
+    echo "  On macOS: brew install curl (if using Homebrew)"
+    exit 1
+fi
+
+# Check if jq is installed (for JSON parsing)
+JQ_AVAILABLE=false
+if ! command -v jq &> /dev/null; then
+    echo "Warning: 'jq' is not installed. JSON output will be printed raw. It is highly recommended to install 'jq' for better readability and error handling."
+    echo "  On Debian/Ubuntu: sudo apt-get install jq"
+    echo "  On macOS: brew install jq (if using Homebrew)"
+else
+    JQ_AVAILABLE=true
+fi
+
+# Check if ffmpeg is available for audio conversion
+FFMPEG_AVAILABLE=false
+if command -v ffmpeg &> /dev/null; then
+    FFMPEG_AVAILABLE=true
+else
+    echo "Error: 'ffmpeg' is required for audio segmentation and conversion."
+    echo "  On Debian/Ubuntu: sudo apt-get install ffmpeg"
+    echo "  On macOS: brew install ffmpeg"
+    exit 1
+fi
+
+# Validate configuration variables
+if [ -z "$SPEECH_KEY" ] || [ -z "$SPEECH_REGION" ]; then
+    echo "Error: SPEECH_KEY and SPEECH_REGION must be set in .env file or as environment variables."
+    echo "Please create a .env file with:"
+    echo "  SPEECH_KEY=your_azure_speech_key"
+    echo "  SPEECH_REGION=your_azure_region"
+    exit 1
+fi
+
+if [ ! -f "$AUDIO_FILE" ]; then
+    echo "Error: Audio file not found at '$AUDIO_FILE'. Please ensure the path is correct and the file exists."
+    exit 1
+fi
+
+# Determine Content-Type header based on file extension
+# This is a basic check. For more robust detection, consider 'file --mime-type'.
+# Ensure this matches the actual format of your audio file.
+FILE_EXTENSION="${AUDIO_FILE##*.}"
+CONTENT_TYPE=""
+CONVERTED_FILE=""
+
+case "$(echo "$FILE_EXTENSION" | tr '[:upper:]' '[:lower:]')" in
+    wav)
+        # Assuming 16kHz, 16-bit, mono PCM. Adjust samplerate if different.
+        CONTENT_TYPE="audio/wav"
+        ;;
+    mp3)
+        CONTENT_TYPE="audio/mpeg"
+        ;;
+    ogg)
+        CONTENT_TYPE="audio/ogg; codecs=opus"
+        ;;
+    m4a|aac|mp4|flac|webm)
+        if $FFMPEG_AVAILABLE; then
+            echo "Converting $FILE_EXTENSION to WAV format for Azure Speech Service compatibility..."
+            CONVERTED_FILE="/tmp/azure_stt_converted_audio_$(date +%s).wav"
+            if ffmpeg -i "$AUDIO_FILE" -ar 16000 -ac 1 -c:a pcm_s16le "$CONVERTED_FILE" -y > /dev/null 2>&1; then
+                AUDIO_FILE="$CONVERTED_FILE"
+                CONTENT_TYPE="audio/wav"
+                echo "Audio converted successfully to: $CONVERTED_FILE"
+            else
+                echo "Error: Failed to convert audio file. Please ensure the file is a valid audio format."
+                exit 1
+            fi
+        else
+            echo "Error: Format '$FILE_EXTENSION' is not directly supported by Azure Speech Service."
+            echo "Please install 'ffmpeg' for automatic conversion, or convert the file to WAV/MP3/OGG manually."
+            echo "  On Debian/Ubuntu: sudo apt-get install ffmpeg"
+            echo "  On macOS: brew install ffmpeg"
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Warning: Unsupported audio file format '$FILE_EXTENSION'. Defaulting Content-Type to 'audio/wav'."
+        echo "         Please ensure your audio file is actually a 16kHz, 16-bit, mono WAV, or update the script's CONTENT_TYPE."
+        echo "         Supported formats: WAV (PCM), MP3, OGG (Opus). Auto-convertible with ffmpeg: M4A, AAC, MP4, FLAC, WebM."
+        CONTENT_TYPE="audio/wav" # Fallback
+        ;;
+esac
+
+# --- Audio Segmentation ---
+
+# Create temporary directory for segments
+TEMP_DIR="/tmp/azure_stt_segments_$(date +%s)"
+mkdir -p "$TEMP_DIR"
+echo -e "\n--- Segmenting Audio File ---"
+echo "  Segment duration: ${SEGMENT_TIME} seconds"
+echo "  Temporary directory: $TEMP_DIR"
+
+# Split audio into segments
+SEGMENT_PATTERN="$TEMP_DIR/segment_%03d.wav"
+echo "Splitting audio file..."
+if ! ffmpeg -i "$AUDIO_FILE" -f segment -segment_time "$SEGMENT_TIME" -reset_timestamps 1 -map 0:a -ar 16000 -ac 1 -c:a pcm_s16le "$SEGMENT_PATTERN" -y > /dev/null 2>&1; then
+    echo "Error: Failed to segment audio file."
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Count segments
+SEGMENT_FILES=("$TEMP_DIR"/segment_*.wav)
+SEGMENT_COUNT=${#SEGMENT_FILES[@]}
+echo "Audio split into $SEGMENT_COUNT segment(s)."
+
+# --- Process All Segments ---
+
+echo -e "\n--- Processing Segments ---"
+
+# Azure Speech-to-Text REST API endpoint for short audio transcription.
+API_ENDPOINT="https://$SPEECH_REGION.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=$LANGUAGE"
+
+# Initialize output file if specified (clear existing content)
+if [ ! -z "$OUTPUT_FILE" ]; then
+    > "$OUTPUT_FILE"
+fi
+
+# Progress bar function
+show_progress() {
+    local current=$1
+    local total=$2
+    local percent=$((current * 100 / total))
+    local filled=$((percent / 2))
+    local empty=$((50 - filled))
+    
+    printf "\r["
+    printf "%${filled}s" | tr ' ' '='
+    printf "%${empty}s" | tr ' ' ' '
+    printf "] %3d%% (%d/%d)" "$percent" "$current" "$total"
+}
+
+# Clear progress bar line
+clear_progress() {
+    printf "\r%80s\r" ""
+}
+
+# Process each segment
+for i in "${!SEGMENT_FILES[@]}"; do
+    SEGMENT_FILE="${SEGMENT_FILES[$i]}"
+    SEGMENT_NUM=$((i + 1))
+    
+    # Calculate time range for this segment
+    START_TIME=$((i * SEGMENT_TIME))
+    END_TIME=$(((i + 1) * SEGMENT_TIME))
+    
+    # Format time as HH:MM:SS
+    START_TIME_FORMATTED=$(printf "%02d:%02d:%02d" $((START_TIME/3600)) $(((START_TIME%3600)/60)) $((START_TIME%60)))
+    END_TIME_FORMATTED=$(printf "%02d:%02d:%02d" $((END_TIME/3600)) $(((END_TIME%3600)/60)) $((END_TIME%60)))
+    
+    # Show progress (always)
+    show_progress "$SEGMENT_NUM" "$SEGMENT_COUNT"
+    
+    # Show verbose segment info
+    if $VERBOSE_MODE; then
+        clear_progress
+        echo -e "\n--- Segment $SEGMENT_NUM of $SEGMENT_COUNT ($START_TIME_FORMATTED - $END_TIME_FORMATTED) ---"
+        echo "  File: $(basename "$SEGMENT_FILE")"
+        echo "  Processing..."
+    fi
+    
+    # Make the curl request
+    RESPONSE=$(curl -s -X POST \
+      -H "Ocp-Apim-Subscription-Key: ${SPEECH_KEY}" \
+      -H "Content-Type: audio/wav" \
+      --data-binary @"$SEGMENT_FILE" \
+      "$API_ENDPOINT")
+    
+    # Process Response
+    if [ -z "$RESPONSE" ]; then
+        if ! $SILENT_MODE; then
+            clear_progress
+            echo "  Error: No response received for segment $SEGMENT_NUM (Time: $START_TIME_FORMATTED - $END_TIME_FORMATTED)"
+        fi
+        continue
+    fi
+    
+    # Check if response is valid JSON
+    if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+        if ! $SILENT_MODE; then
+            clear_progress
+            echo "  Error: Invalid response for segment $SEGMENT_NUM (Time: $START_TIME_FORMATTED - $END_TIME_FORMATTED)"
+            if $VERBOSE_MODE; then
+                echo "  Raw response: $RESPONSE"
+            fi
+        fi
+        continue
+    fi
+    
+    if $JQ_AVAILABLE; then
+        # Check for errors
+        ERROR_MESSAGE=$(echo "$RESPONSE" | jq -r 'select(.error != null) | .error.message // empty')
+        if [ ! -z "$ERROR_MESSAGE" ]; then
+            if ! $SILENT_MODE; then
+                clear_progress
+                echo "  Error at $START_TIME_FORMATTED - $END_TIME_FORMATTED: $ERROR_MESSAGE"
+                if $VERBOSE_MODE; then
+                    echo "  Full response:"
+                    echo "$RESPONSE" | jq .
+                fi
+            fi
+            if [ ! -z "$OUTPUT_FILE" ]; then
+                echo "[Error at $START_TIME_FORMATTED - $END_TIME_FORMATTED: $ERROR_MESSAGE]" >> "$OUTPUT_FILE"
+            fi
+            continue
+        fi
+        
+        # Extract transcription
+        TRANSCRIPTION=$(echo "$RESPONSE" | jq -r '.DisplayText // empty')
+        
+        if [ -z "$TRANSCRIPTION" ]; then
+            if ! $SILENT_MODE; then
+                clear_progress
+                echo "  Warning: Empty transcription for segment $SEGMENT_NUM (Time: $START_TIME_FORMATTED - $END_TIME_FORMATTED)"
+            fi
+        else
+            if ! $SILENT_MODE; then
+                if ! $VERBOSE_MODE; then
+                    clear_progress
+                fi
+                echo "  $TRANSCRIPTION"
+                if $VERBOSE_MODE; then
+                    # Show additional details in verbose mode
+                    RECOGNITION_STATUS=$(echo "$RESPONSE" | jq -r '.RecognitionStatus // "N/A"')
+                    DURATION=$(echo "$RESPONSE" | jq -r '.Duration // "N/A"')
+                    echo "  Recognition Status: $RECOGNITION_STATUS"
+                    echo "  Duration: $DURATION"
+                fi
+            fi
+            if [ ! -z "$OUTPUT_FILE" ]; then
+                echo "$TRANSCRIPTION" >> "$OUTPUT_FILE"
+            fi
+        fi
+    else
+        if ! $SILENT_MODE; then
+            clear_progress
+            echo "  Raw response: $RESPONSE"
+        fi
+        TRANSCRIPTION=$(echo "$RESPONSE" | grep -oP '"DisplayText":\s*"\K[^"]*')
+        if [ -z "$TRANSCRIPTION" ]; then
+            if [ ! -z "$OUTPUT_FILE" ]; then
+                echo "[Could not parse segment $SEGMENT_NUM at $START_TIME_FORMATTED - $END_TIME_FORMATTED]" >> "$OUTPUT_FILE"
+            fi
+        else
+            if [ ! -z "$OUTPUT_FILE" ]; then
+                echo "$TRANSCRIPTION" >> "$OUTPUT_FILE"
+            fi
+        fi
+    fi
+done
+
+# Print newline after progress bar in silent mode
+if $SILENT_MODE; then
+    echo ""
+else
+    clear_progress
+fi
+
+# --- Cleanup ---
+
+echo -e "\n--- Cleaning Up ---"
+rm -rf "$TEMP_DIR"
+echo "Temporary segment files cleaned up."
+
+# Clean up converted file if exists
+if [ ! -z "$CONVERTED_FILE" ] && [ -f "$CONVERTED_FILE" ]; then
+    rm -f "$CONVERTED_FILE"
+    echo "Temporary converted file cleaned up."
+fi
+
+echo -e "\n--- Script Finished ---"
