@@ -16,8 +16,13 @@ SPEECH_REGION="${SPEECH_REGION:-}"
 LANGUAGE="${LANGUAGE:-en-US}"
 SEGMENT_TIME=""  # Will be set by parameter or env or default
 OUTPUT_FILE=""   # Will be set by parameter if provided
-SILENT_MODE=false  # Silent mode flag
-VERBOSE_MODE=false  # Verbose mode flag
+SILENT_MODE=false 
+VERBOSE_MODE=false
+DYNAMIC_SPLIT_MODE=false
+
+# Dynamic split specific parameters
+SILENCE_THRESHOLD=-20   # Noise level (in dB) below which audio is considered "silent"
+MIN_SILENCE_DURATION=2  # Minimum duration (in seconds) of silence to be considered a split candidate
 
 # Handle audio file from command line argument or environment variable
 AUDIO_FILE=""
@@ -41,20 +46,27 @@ while [[ $# -gt 0 ]]; do
             VERBOSE_MODE=true
             shift
             ;;
+        -d|--dynamic-split)
+            DYNAMIC_SPLIT_MODE=true
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 [options] <audio_file_path>"
             echo ""
             echo "Azure Speech-to-Text transcription tool with audio segmentation support."
             echo ""
             echo "Options:"
-            echo "  -S, --split <seconds>    Segment duration in seconds (default: 30)"
-            echo "  -o, --output       Save transcription to file (written gradually)"
+            echo "  -S, --split <seconds>    Segment duration in seconds (default: 30)."
+            echo "                           For dynamic split, this is the *minimum* segment duration."
+            echo "  -d, --dynamic-split      Enable dynamic splitting based on silence detection and minimum segment duration."
+            echo "  -o, --output <file>      Save transcription to file"
             echo "  -s, --silent             Silent mode (only show progress percentage)"
             echo "  -v, --verbose            Verbose mode (show detailed segment information)"
-            echo "  -h, --help               Show this help message and exit"
+            echo "  -h|--help                Show this help message and exit"
             echo ""
             echo "Examples:"
             echo "  $0 -S 300 -o result.txt audio.m4a"
+            echo "  $0 -d -S 30 -o result.txt audio.m4a  # Dynamic split, min segment 30s"
             echo "  $0 -s -o result.txt audio.wav"
             echo "  $0 -v -o result.txt audio.mp3"
             echo ""
@@ -92,13 +104,15 @@ if [ -z "$AUDIO_FILE" ]; then
     echo ""
     echo "Usage: $0 [options] <audio_file_path>"
     echo "Options:"
-    echo "  -S, --split <seconds>    Segment duration in seconds (default: 30)"
+    echo "  -S, --split <seconds>    Segment duration in seconds (default: 30). For dynamic split, this is the minimum segment duration."
+    echo "  -d, --dynamic-split      Enable dynamic splitting based on silence detection and minimum segment duration."
     echo "  -o, --output <file>      Save transcription to file (written gradually)"
     echo "  -s, --silent             Silent mode (only show progress percentage)"
     echo "  -v, --verbose            Verbose mode (show detailed segment information)"
-    echo "  -h, --help               Show help message"
+    echo "  -h|--help                Show help message"
     echo ""
     echo "Example: $0 -S 300 -o result.txt ./my_audio.wav"
+    echo "         $0 -d -S 30 -o result.txt ./my_audio.wav"
     echo "         $0 -s -o result.txt ./my_audio.wav"
     echo "         $0 -v -o result.txt ./my_audio.wav"
     echo ""
@@ -124,14 +138,23 @@ else
     JQ_AVAILABLE=true
 fi
 
-# Check if ffmpeg is available for audio conversion
+# Check if ffmpeg and ffprobe are available for audio conversion and segmentation
 FFMPEG_AVAILABLE=false
+FFPROBE_AVAILABLE=false
 if command -v ffmpeg &> /dev/null; then
     FFMPEG_AVAILABLE=true
 else
     echo "Error: 'ffmpeg' is required for audio segmentation and conversion."
     echo "  On Debian/Ubuntu: sudo apt-get install ffmpeg"
     echo "  On macOS: brew install ffmpeg"
+    exit 1
+fi
+if command -v ffprobe &> /dev/null; then
+    FFPROBE_AVAILABLE=true
+else
+    echo "Error: 'ffprobe' is required for dynamic audio segmentation."
+    echo "  On Debian/Ubuntu: sudo apt-get install ffmpeg" # ffprobe usually comes with ffmpeg
+    echo "  On macOS: brew install ffmpeg" # ffprobe usually comes with ffmpeg
     exit 1
 fi
 
@@ -155,6 +178,7 @@ fi
 FILE_EXTENSION="${AUDIO_FILE##*.}"
 CONTENT_TYPE=""
 CONVERTED_FILE=""
+ORIGINAL_AUDIO_FILE="$AUDIO_FILE" # Keep track of the original for cleanup purposes
 
 case "$(echo "$FILE_EXTENSION" | tr '[:upper:]' '[:lower:]')" in
     wav)
@@ -172,7 +196,7 @@ case "$(echo "$FILE_EXTENSION" | tr '[:upper:]' '[:lower:]')" in
             echo "Converting $FILE_EXTENSION to WAV format for Azure Speech Service compatibility..."
             CONVERTED_FILE="/tmp/azure_stt_converted_audio_$(date +%s).wav"
             if ffmpeg -i "$AUDIO_FILE" -ar 16000 -ac 1 -c:a pcm_s16le "$CONVERTED_FILE" -y > /dev/null 2>&1; then
-                AUDIO_FILE="$CONVERTED_FILE"
+                AUDIO_FILE="$CONVERTED_FILE" # Update AUDIO_FILE to point to the converted one
                 CONTENT_TYPE="audio/wav"
                 echo "Audio converted successfully to: $CONVERTED_FILE"
             else
@@ -201,22 +225,174 @@ esac
 TEMP_DIR="/tmp/azure_stt_segments_$(date +%s)"
 mkdir -p "$TEMP_DIR"
 echo -e "\n--- Segmenting Audio File ---"
-echo "  Segment duration: ${SEGMENT_TIME} seconds"
 echo "  Temporary directory: $TEMP_DIR"
 
-# Split audio into segments
-SEGMENT_PATTERN="$TEMP_DIR/segment_%03d.wav"
-echo "Splitting audio file..."
-if ! ffmpeg -i "$AUDIO_FILE" -f segment -segment_time "$SEGMENT_TIME" -reset_timestamps 1 -map 0:a -ar 16000 -ac 1 -c:a pcm_s16le "$SEGMENT_PATTERN" -y > /dev/null 2>&1; then
-    echo "Error: Failed to segment audio file."
-    rm -rf "$TEMP_DIR"
-    exit 1
+declare -a SEGMENT_INFO # Array to hold "start_time:duration" for each segment
+SEGMENT_COUNT=0
+
+if $DYNAMIC_SPLIT_MODE; then
+    echo "  Dynamic splitting enabled. Minimum segment duration: ${SEGMENT_TIME} seconds."
+    echo "  Silence threshold: ${SILENCE_THRESHOLD}dB, minimum silence duration: ${MIN_SILENCE_DURATION}s."
+
+    # 1. Get the total duration of the input file
+    echo "Getting duration of '$AUDIO_FILE'..."
+    FILE_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE")
+
+    if [ -z "$FILE_DURATION" ]; then
+        echo "Error: Could not determine duration of '$AUDIO_FILE'. Is it a valid audio file?"
+        rm -rf "$TEMP_DIR"
+        # Clean up converted file if exists before exiting
+        if [ ! -z "$CONVERTED_FILE" ] && [ -f "$CONVERTED_FILE" ]; then
+            rm -f "$CONVERTED_FILE"
+        fi
+        exit 1
+    fi
+    echo "Total file duration: $(printf "%.2f" "$FILE_DURATION") seconds."
+
+    # 2. Detect all silence periods using ffmpeg
+    echo "Detecting silences..."
+    # The silencedetect filter outputs to stderr, so we redirect stderr to stdout (2>&1)
+    # and then filter with grep.
+    SILENCE_LOG=$(ffmpeg -i "$AUDIO_FILE" -af "silencedetect=n=${SILENCE_THRESHOLD}dB:d=${MIN_SILENCE_DURATION}" -f null - 2>&1)
+
+    # Store potential split points. Start with 0 (beginning of the file).
+    declare -a SPLIT_POINTS=(0)
+    LAST_ACTUAL_SPLIT_TIME=0
+
+    # Process silence detection output
+    # Using 'while IFS= read -r line' to process line by line, preserving spaces.
+    # The subshell for 'while' loop means variables modified inside won't affect outside.
+    # So, we'll collect results and process them in the main shell.
+    declare -a DETECTED_SILENCES
+    while IFS= read -r line; do
+        if [[ "$line" =~ silence_start ]]; then
+            DETECTED_SILENCES+=("$line")
+        fi
+    done <<< "$SILENCE_LOG"
+
+    for line in "${DETECTED_SILENCES[@]}"; do
+        # Extract silence_start time
+        SILENCE_START=$(echo "$line" | sed -n 's/.*silence_start: \([0-9.]*\).*/\1/p')
+
+        # Use 'bc -l' for floating point arithmetic comparison
+        # Condition 1: Has at least SEGMENT_TIME elapsed since the last actual split?
+        if (( $(echo "$SILENCE_START - $LAST_ACTUAL_SPLIT_TIME >= $SEGMENT_TIME" | bc -l) )); then
+            # Condition 2: If we split here, would the *remaining* part of the file be too short?
+            # If (FILE_DURATION - SILENCE_START) < SEGMENT_TIME, it's better not to split here
+            # and just extend the current segment to the end of the file.
+            if (( $(echo "$FILE_DURATION - $SILENCE_START < $SEGMENT_TIME" | bc -l) )); then
+                if $VERBOSE_MODE; then
+                    echo "  Skipping potential split at $(printf "%.2f" "$SILENCE_START")s: Remaining duration too short (< ${SEGMENT_TIME}s)."
+                fi
+                continue # Skip this silence point, let the current segment extend further
+            fi
+
+            # If both conditions pass, this is a valid split point
+            SPLIT_POINTS+=("$SILENCE_START")
+            LAST_ACTUAL_SPLIT_TIME="$SILENCE_START"
+            if $VERBOSE_MODE; then
+                echo "  Adding split point at $(printf "%.2f" "$SILENCE_START")s."
+            fi
+        else
+            if $VERBOSE_MODE; then
+                echo "  Ignoring silence at $(printf "%.2f" "$SILENCE_START")s: Not enough time elapsed since last split (< ${SEGMENT_TIME}s)."
+            fi
+        fi
+    done
+
+    # Ensure the very end of the file is always included as the last segment boundary.
+    # This handles cases where the last segment is naturally long enough or if no silences were found.
+    # Check if the last split point is not already the end of the file.
+    # FIX: Replaced negative array indexing with compatible syntax for older Bash versions.
+    if (( $(echo "${SPLIT_POINTS[${#SPLIT_POINTS[@]}-1]} < $FILE_DURATION" | bc -l) )); then
+        SPLIT_POINTS+=("$FILE_DURATION")
+        if $VERBOSE_MODE; then
+            echo "  Adding end of file as final split point at $(printf "%.2f" "$FILE_DURATION")s."
+        fi
+    fi
+
+    if $VERBOSE_MODE; then
+        echo -e "\nCalculated final split points (seconds): ${SPLIT_POINTS[@]}"
+    fi
+
+    # Populate SEGMENT_INFO with "start_time:duration"
+    for i in "${!SPLIT_POINTS[@]}"; do
+        START_TIME="${SPLIT_POINTS[$i]}"
+        NEXT_INDEX=$((i + 1))
+
+        if [ "$NEXT_INDEX" -lt "${#SPLIT_POINTS[@]}" ]; then
+            END_TIME="${SPLIT_POINTS[$NEXT_INDEX]}"
+            DURATION=$(echo "$END_TIME - $START_TIME" | bc -l)
+
+            if (( $(echo "$DURATION > 0" | bc -l) )); then
+                SEGMENT_INFO+=("$(printf "%.2f" "$START_TIME"):$(printf "%.2f" "$DURATION")")
+            else
+                if $VERBOSE_MODE; then
+                    echo "Warning: Calculated segment duration is zero or negative at start $START_TIME. Skipping."
+                fi
+            fi
+        fi
+    done
+    SEGMENT_COUNT=${#SEGMENT_INFO[@]}
+    echo "Audio will be dynamically split into $SEGMENT_COUNT segment(s)."
+
+else # Fixed splitting mode
+    echo "  Fixed splitting enabled. Segment duration: ${SEGMENT_TIME} seconds."
+    # Split audio into segments using ffmpeg's segment muxer
+    # This creates temporary files directly in TEMP_DIR
+    SEGMENT_PATTERN="$TEMP_DIR/segment_%03d.wav"
+    echo "Splitting audio file..."
+    if ! ffmpeg -i "$AUDIO_FILE" -f segment -segment_time "$SEGMENT_TIME" -reset_timestamps 1 -map 0:a -ar 16000 -ac 1 -c:a pcm_s16le "$SEGMENT_PATTERN" -y > /dev/null 2>&1; then
+        echo "Error: Failed to segment audio file."
+        rm -rf "$TEMP_DIR"
+        # Clean up converted file if exists before exiting
+        if [ ! -z "$CONVERTED_FILE" ] && [ -f "$CONVERTED_FILE" ]; then
+            rm -f "$CONVERTED_FILE"
+        fi
+        exit 1
+    fi
+
+    # Get duration of the input file first to calculate segment end times for SEGMENT_INFO
+    FILE_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$AUDIO_FILE")
+    if [ -z "$FILE_DURATION" ]; then
+        echo "Error: Could not determine duration of '$AUDIO_FILE'. Is it a valid audio file?"
+        rm -rf "$TEMP_DIR"
+        # Clean up converted file if exists before exiting
+        if [ ! -z "$CONVERTED_FILE" ] && [ -f "$CONVERTED_FILE" ]; then
+            rm -f "$CONVERTED_FILE"
+        fi
+        exit 1
+    fi
+
+    # List all generated segment files to get the count and populate SEGMENT_INFO
+    SEGMENT_FILES=("$TEMP_DIR"/segment_*.wav)
+    SEGMENT_COUNT=${#SEGMENT_FILES[@]}
+
+    for i in "${!SEGMENT_FILES[@]}"; do
+        START_TIME=$(echo "$i * $SEGMENT_TIME" | bc -l)
+        END_TIME=$(echo "($i + 1) * $SEGMENT_TIME" | bc -l)
+        # Ensure the last segment's duration doesn't exceed FILE_DURATION
+        if (( $(echo "$END_TIME > $FILE_DURATION" | bc -l) )); then
+            END_TIME="$FILE_DURATION"
+        fi
+        DURATION=$(echo "$END_TIME - $START_TIME" | bc -l)
+        if (( $(echo "$DURATION > 0" | bc -l) )); then
+            SEGMENT_INFO+=("$(printf "%.2f" "$START_TIME"):$(printf "%.2f" "$DURATION")")
+        fi
+    done
+    
+    echo "Audio split into $SEGMENT_COUNT segment(s)."
 fi
 
-# Count segments
-SEGMENT_FILES=("$TEMP_DIR"/segment_*.wav)
-SEGMENT_COUNT=${#SEGMENT_FILES[@]}
-echo "Audio split into $SEGMENT_COUNT segment(s)."
+# If no segments were found (e.g., very short audio and dynamic split rules)
+if [ "$SEGMENT_COUNT" -eq 0 ]; then
+    echo "Error: No valid audio segments could be generated. Check input file or splitting parameters."
+    rm -rf "$TEMP_DIR"
+    if [ ! -z "$CONVERTED_FILE" ] && [ -f "$CONVERTED_FILE" ]; then
+        rm -f "$CONVERTED_FILE"
+    fi
+    exit 1
+fi
 
 # --- Process All Segments ---
 
@@ -250,18 +426,55 @@ clear_progress() {
 }
 
 # Process each segment
-for i in "${!SEGMENT_FILES[@]}"; do
-    SEGMENT_FILE="${SEGMENT_FILES[$i]}"
+for i in "${!SEGMENT_INFO[@]}"; do
+    SEGMENT_DATA_ENTRY="${SEGMENT_INFO[$i]}"
+    START_TIME=$(echo "$SEGMENT_DATA_ENTRY" | cut -d':' -f1)
+    DURATION=$(echo "$SEGMENT_DATA_ENTRY" | cut -d':' -f2)
+    
     SEGMENT_NUM=$((i + 1))
     
-    # Calculate time range for this segment
-    START_TIME=$((i * SEGMENT_TIME))
-    END_TIME=$(((i + 1) * SEGMENT_TIME))
+    # Calculate end time for display
+    END_TIME=$(echo "$START_TIME + $DURATION" | bc -l)
     
     # Format time as HH:MM:SS
-    START_TIME_FORMATTED=$(printf "%02d:%02d:%02d" $((START_TIME/3600)) $(((START_TIME%3600)/60)) $((START_TIME%60)))
-    END_TIME_FORMATTED=$(printf "%02d:%02d:%02d" $((END_TIME/3600)) $(((END_TIME%3600)/60)) $((END_TIME%60)))
+    # Using integer part for HH:MM:SS formatting to avoid issues with printf %d on floats
+    START_TIME_INT=${START_TIME%.*}
+    END_TIME_INT=${END_TIME%.*}
+    START_TIME_FORMATTED=$(printf "%02d:%02d:%02d" $(( START_TIME_INT / 3600 )) $((( START_TIME_INT % 3600 ) / 60 )) $(( START_TIME_INT % 60 )))
+    END_TIME_FORMATTED=$(printf "%02d:%02d:%02d" $(( END_TIME_INT / 3600 )) $((( END_TIME_INT % 3600 ) / 60 )) $(( END_TIME_INT % 60 )))
     
+    # Define the path for the temporary segment file to be sent to Azure
+    CURRENT_SEGMENT_FILE="$TEMP_DIR/current_segment_$(printf "%03d" "$SEGMENT_NUM").wav"
+
+    # If dynamic split, we extract the segment on-the-fly.
+    # If fixed split, the files are already generated and named sequentially in TEMP_DIR.
+    # We'll point CURRENT_SEGMENT_FILE to the pre-generated one in fixed mode.
+    if $DYNAMIC_SPLIT_MODE; then
+        if ! ffmpeg -i "$AUDIO_FILE" -ss "$START_TIME" -t "$DURATION" \
+                   -ar 16000 -ac 1 -c:a pcm_s16le "$CURRENT_SEGMENT_FILE" -y >/dev/null 2>&1; then
+            echo "Error: Failed to extract dynamic segment $((SEGMENT_NUM)). Skipping."
+            continue
+        fi
+    else
+        # In fixed split mode, the files are already generated and named sequentially.
+        # The SEGMENT_FILES array (used only in fixed mode) holds these paths.
+        # We need to ensure SEGMENT_FILES is populated if fixed split was used.
+        # The `SEGMENT_INFO` array is now the primary source for segment details.
+        # The actual file path for fixed segments would be:
+        # "$TEMP_DIR/segment_$(printf "%03d" "$i").wav" (assuming 0-indexed for $i)
+        # The previous fixed-split logic populated SEGMENT_FILES, let's use that.
+        # But wait, SEGMENT_FILES is local to the 'else' block where it's defined.
+        # Let's make it consistent: in fixed mode, we'll use the pre-generated files.
+        # So, CURRENT_SEGMENT_FILE will be the actual path of the pre-generated file.
+        CURRENT_SEGMENT_FILE="$TEMP_DIR/segment_$(printf "%03d" "$i").wav" # Assuming 0-indexed for ffmpeg segment output
+    fi
+
+    # Check if the segment file actually exists before processing
+    if [ ! -f "$CURRENT_SEGMENT_FILE" ]; then
+        echo "Error: Segment file '$CURRENT_SEGMENT_FILE' not found. Skipping segment $SEGMENT_NUM."
+        continue
+    fi
+
     # Show progress (always)
     show_progress "$SEGMENT_NUM" "$SEGMENT_COUNT"
     
@@ -269,7 +482,7 @@ for i in "${!SEGMENT_FILES[@]}"; do
     if $VERBOSE_MODE; then
         clear_progress
         echo -e "\n--- Segment $SEGMENT_NUM of $SEGMENT_COUNT ($START_TIME_FORMATTED - $END_TIME_FORMATTED) ---"
-        echo "  File: $(basename "$SEGMENT_FILE")"
+        echo "  File: $(basename "$CURRENT_SEGMENT_FILE") (Start: $(printf "%.2f" "$START_TIME")s, Duration: $(printf "%.2f" "$DURATION")s)"
         echo "  Processing..."
     fi
     
@@ -277,7 +490,7 @@ for i in "${!SEGMENT_FILES[@]}"; do
     RESPONSE=$(curl -s -X POST \
       -H "Ocp-Apim-Subscription-Key: ${SPEECH_KEY}" \
       -H "Content-Type: audio/wav" \
-      --data-binary @"$SEGMENT_FILE" \
+      --data-binary @"$CURRENT_SEGMENT_FILE" \
       "$API_ENDPOINT")
     
     # Process Response
@@ -285,6 +498,10 @@ for i in "${!SEGMENT_FILES[@]}"; do
         if ! $SILENT_MODE; then
             clear_progress
             echo "  Error: No response received for segment $SEGMENT_NUM (Time: $START_TIME_FORMATTED - $END_TIME_FORMATTED)"
+        fi
+        # Clean up the temporary segment file for dynamic split if it was created
+        if $DYNAMIC_SPLIT_MODE && [ -f "$CURRENT_SEGMENT_FILE" ]; then
+            rm -f "$CURRENT_SEGMENT_FILE"
         fi
         continue
     fi
@@ -297,6 +514,10 @@ for i in "${!SEGMENT_FILES[@]}"; do
             if $VERBOSE_MODE; then
                 echo "  Raw response: $RESPONSE"
             fi
+        fi
+        # Clean up the temporary segment file for dynamic split if it was created
+        if $DYNAMIC_SPLIT_MODE && [ -f "$CURRENT_SEGMENT_FILE" ]; then
+            rm -f "$CURRENT_SEGMENT_FILE"
         fi
         continue
     fi
@@ -316,6 +537,10 @@ for i in "${!SEGMENT_FILES[@]}"; do
             if [ ! -z "$OUTPUT_FILE" ]; then
                 echo "[Error at $START_TIME_FORMATTED - $END_TIME_FORMATTED: $ERROR_MESSAGE]" >> "$OUTPUT_FILE"
             fi
+            # Clean up the temporary segment file for dynamic split if it was created
+            if $DYNAMIC_SPLIT_MODE && [ -f "$CURRENT_SEGMENT_FILE" ]; then
+                rm -f "$CURRENT_SEGMENT_FILE"
+            fi
             continue
         fi
         
@@ -328,38 +553,51 @@ for i in "${!SEGMENT_FILES[@]}"; do
                 echo "  Warning: Empty transcription for segment $SEGMENT_NUM (Time: $START_TIME_FORMATTED - $END_TIME_FORMATTED)"
             fi
         else
+            # Format timestamp prefix
+            TIMESTAMP_PREFIX="[$START_TIME_FORMATTED - $END_TIME_FORMATTED]"
+            
             if ! $SILENT_MODE; then
                 if ! $VERBOSE_MODE; then
                     clear_progress
                 fi
-                echo "  $TRANSCRIPTION"
+                echo "  $TIMESTAMP_PREFIX $TRANSCRIPTION"
                 if $VERBOSE_MODE; then
                     # Show additional details in verbose mode
                     RECOGNITION_STATUS=$(echo "$RESPONSE" | jq -r '.RecognitionStatus // "N/A"')
-                    DURATION=$(echo "$RESPONSE" | jq -r '.Duration // "N/A"')
+                    DURATION_MS=$(echo "$RESPONSE" | jq -r '.Duration // "N/A"') # Duration in milliseconds
+                    DURATION_SEC=$(echo "scale=2; $DURATION_MS / 1000" | bc -l)
                     echo "  Recognition Status: $RECOGNITION_STATUS"
-                    echo "  Duration: $DURATION"
+                    echo "  Recognized Duration: ${DURATION_SEC}s"
                 fi
             fi
             if [ ! -z "$OUTPUT_FILE" ]; then
-                echo "$TRANSCRIPTION" >> "$OUTPUT_FILE"
+                echo "$TIMESTAMP_PREFIX $TRANSCRIPTION" >> "$OUTPUT_FILE"
             fi
         fi
-    else
+    else # JQ_AVAILABLE is false
         if ! $SILENT_MODE; then
             clear_progress
             echo "  Raw response: $RESPONSE"
         fi
+        # Attempt to extract DisplayText without jq
         TRANSCRIPTION=$(echo "$RESPONSE" | grep -oP '"DisplayText":\s*"\K[^"]*')
+        # Format timestamp prefix
+        TIMESTAMP_PREFIX="[$START_TIME_FORMATTED - $END_TIME_FORMATTED]"
+        
         if [ -z "$TRANSCRIPTION" ]; then
             if [ ! -z "$OUTPUT_FILE" ]; then
                 echo "[Could not parse segment $SEGMENT_NUM at $START_TIME_FORMATTED - $END_TIME_FORMATTED]" >> "$OUTPUT_FILE"
             fi
         else
             if [ ! -z "$OUTPUT_FILE" ]; then
-                echo "$TRANSCRIPTION" >> "$OUTPUT_FILE"
+                echo "$TIMESTAMP_PREFIX $TRANSCRIPTION" >> "$OUTPUT_FILE"
             fi
         fi
+    fi
+
+    # Clean up the temporary segment file for dynamic split if it was created
+    if $DYNAMIC_SPLIT_MODE && [ -f "$CURRENT_SEGMENT_FILE" ]; then
+        rm -f "$CURRENT_SEGMENT_FILE"
     fi
 done
 
