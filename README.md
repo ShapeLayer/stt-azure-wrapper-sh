@@ -20,7 +20,6 @@ A simple wrapper for the Azure Speech-to-Text (STT) service. It provides an easy
 
 ```
 ❯ ./stt
-❯ ./stt
 Loading configuration from .env file...
 Error: No audio file specified.
 
